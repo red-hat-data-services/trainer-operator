@@ -1,0 +1,4 @@
+map:
+  odh-trainer:
+    src: manifests
+    dest: trainer

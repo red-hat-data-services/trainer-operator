@@ -1,0 +1,155 @@
+name: Modular Operator Processor
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  process-manifests:
+    if: ${{ github.ref_name != 'main' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout trainer-operator repo
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.ref_name }}
+          sparse-checkout: |
+            build
+            prefetched-manifests
+          sparse-checkout-cone-mode: false
+
+      - name: Install dependencies
+        run: |
+          os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          arch="$(uname -m | sed 's/x86_64/amd64/')"
+          yq_version="v4.44.3"
+          yq_filename="yq-$yq_version"
+          echo "-> Downloading yq" >&2
+          curl -sSfLo "$yq_filename" "https://github.com/mikefarah/yq/releases/download/$yq_version/yq_${os}_${arch}"
+          chmod +x "$yq_filename"
+          sudo cp "$yq_filename" /usr/local/bin/yq
+
+          sudo apt-get install -y skopeo
+
+      - name: Enrich manifests-config with image metadata
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -e
+          CONFIG="${{ github.workspace }}/build/manifests-config.yaml"
+
+          while IFS= read -r value; do
+            value=${value/- /}
+            component=$value
+            [[ -z "$component" ]] && continue
+
+            IMAGE_REF="quay.io/rhoai/${component}-rhel9:${BRANCH}"
+            echo "=============================================================="
+            echo "Inspecting: ${IMAGE_REF}"
+            echo "=============================================================="
+
+            inspect=$(skopeo inspect "docker://${IMAGE_REF}" 2>&1) || {
+              echo "::error::Failed to inspect ${IMAGE_REF}: ${inspect}"
+              exit 1
+            }
+
+            git_url=$(echo "$inspect" | jq -r '.Labels["git.url"] // empty')
+            git_commit=$(echo "$inspect" | jq -r '.Labels["git.commit"] // empty')
+            digest=$(echo "$inspect" | jq -r '.Digest')
+
+            if [[ -z "$git_url" || -z "$git_commit" || -z "$digest" ]]; then
+              echo "::error::Missing expected labels or digest for ${IMAGE_REF}"
+              echo "Labels found: $(echo "$inspect" | jq '.Labels')"
+              exit 1
+            fi
+
+            image_with_digest="quay.io/rhoai/${component}-rhel9@${digest}"
+
+            value="$component" git_url="$git_url" \
+              yq -i eval '.map[strenv(value)]["git.url"] = strenv(git_url)' "$CONFIG"
+            value="$component" git_commit="$git_commit" \
+              yq -i eval '.map[strenv(value)]["git.commit"] = strenv(git_commit)' "$CONFIG"
+            value="$component" image="$image_with_digest" \
+              yq -i eval '.map[strenv(value)]["image"] = strenv(image)' "$CONFIG"
+
+            echo "  git.url:    ${git_url}"
+            echo "  git.commit: ${git_commit}"
+            echo "  image:      ${image_with_digest}"
+            echo ""
+          done < <(yq e '.map | keys' "$CONFIG")
+
+          echo "--- Updated build/manifests-config.yaml ---"
+          cat "$CONFIG"
+
+      - name: Fetch all manifests
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          #!/bin/bash
+          set -e
+          echo "current dir = $(pwd)"
+
+          MANIFEST_CONFIG_PATH="${{ github.workspace }}/build/manifests-config.yaml"
+          PREFETCHED_MANIFEST_DIR_PATH="${{ github.workspace }}/prefetched-manifests"
+
+          if [ -d "$PREFETCHED_MANIFEST_DIR_PATH" ]; then
+            echo "Cleaning up old prefetched manifests..."
+            rm -rf "$PREFETCHED_MANIFEST_DIR_PATH"
+          fi
+          mkdir -p "$PREFETCHED_MANIFEST_DIR_PATH"
+
+          mkdir -p manifests-work
+          cd manifests-work
+
+          while IFS= read -r value; do
+            value=${value/- /}
+            component=$value
+            [[ -z "$component" ]] && continue
+
+            echo "=============================================================="
+            echo "Fetching Manifest for component: $component"
+            echo "=============================================================="
+
+            git_url=$(value="$value" yq '.map[strenv(value)]["git.url"]' "$MANIFEST_CONFIG_PATH")
+            git_commit=$(value="$value" yq '.map[strenv(value)]["git.commit"]' "$MANIFEST_CONFIG_PATH")
+            src=$(value="$value" yq '.map[strenv(value)]["src"]' "$MANIFEST_CONFIG_PATH")
+            dest=$(value="$value" yq '.map[strenv(value)]["dest"]' "$MANIFEST_CONFIG_PATH")
+
+            echo "component  = $component"
+            echo "git_url    = $git_url"
+            echo "git_commit = $git_commit"
+            echo "src        = $src"
+            echo "dest       = $dest"
+
+            mkdir -p "$component"
+            cd "$component"
+
+            git config --global init.defaultBranch "${BRANCH}"
+            git init
+            git remote add origin "$git_url"
+            git config core.sparseCheckout true
+            git config core.sparseCheckoutCone false
+            echo "$src" >> .git/info/sparse-checkout
+            git fetch --depth=1 origin "$git_commit"
+            git checkout "$git_commit"
+
+            cd ../
+
+            dest_dir_path="${PREFETCHED_MANIFEST_DIR_PATH}/${dest}"
+            mkdir -p "${dest_dir_path}"
+            cp -r "${component}/${src}/"* "${dest_dir_path}/"
+            echo ""
+          done < <(yq e '.map | keys' "$MANIFEST_CONFIG_PATH")
+
+          cd "$PREFETCHED_MANIFEST_DIR_PATH"
+          tree
+
+      - name: Commit and push changes to release branch
+        run: |
+          git config user.name "Openshift-AI DevOps"
+          git config user.email "openshift-ai-devops@redhat.com"
+          git add -A
+          git diff --staged --quiet || (git commit -m "Updating trainer-operator repo with latest images and manifests" && git push origin ${{ github.ref_name }})
