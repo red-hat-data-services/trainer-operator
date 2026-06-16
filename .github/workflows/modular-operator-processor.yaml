@@ -34,6 +34,12 @@ jobs:
 
           sudo apt-get install -y skopeo
 
+      - name: Login to Quay.io
+        run: |
+          skopeo login quay.io \
+            --username "${{ secrets.RHOAI_RO_QUAY_USERNAME }}" \
+            --password "${{ secrets.RHOAI_RO_QUAY_PASSWORD }}"
+
       - name: Enrich manifests-config with image metadata
         env:
           BRANCH: ${{ github.ref_name }}
