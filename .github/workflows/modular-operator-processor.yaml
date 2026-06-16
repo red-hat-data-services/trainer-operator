@@ -26,11 +26,10 @@ jobs:
           os="$(uname -s | tr '[:upper:]' '[:lower:]')"
           arch="$(uname -m | sed 's/x86_64/amd64/')"
           yq_version="v4.44.3"
-          yq_filename="yq-$yq_version"
           echo "-> Downloading yq" >&2
-          curl -sSfLo "$yq_filename" "https://github.com/mikefarah/yq/releases/download/$yq_version/yq_${os}_${arch}"
-          chmod +x "$yq_filename"
-          sudo cp "$yq_filename" /usr/local/bin/yq
+          curl -sSfLo /tmp/yq "https://github.com/mikefarah/yq/releases/download/$yq_version/yq_${os}_${arch}"
+          chmod +x /tmp/yq
+          sudo cp /tmp/yq /usr/local/bin/yq
 
           sudo apt-get install -y skopeo
 
@@ -107,8 +106,8 @@ jobs:
           fi
           mkdir -p "$PREFETCHED_MANIFEST_DIR_PATH"
 
-          mkdir -p manifests-work
-          cd manifests-work
+          mkdir -p /tmp/manifests-work
+          cd /tmp/manifests-work
 
           while IFS= read -r value; do
             value=${value/- /}
@@ -157,5 +156,5 @@ jobs:
         run: |
           git config user.name "Openshift-AI DevOps"
           git config user.email "openshift-ai-devops@redhat.com"
-          git add -A
+          git add build/manifests-config.yaml prefetched-manifests/
           git diff --staged --quiet || (git commit -m "Updating trainer-operator repo with latest images and manifests" && git push origin ${{ github.ref_name }})
