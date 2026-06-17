@@ -2,3 +2,6 @@ map:
   odh-trainer:
     src: manifests
     dest: trainer
+    git.url: https://github.com/red-hat-data-services/trainer
+    git.commit: 0077a53e6579d2e716fd6153cd5055938b07e8a2
+    image: quay.io/rhoai/odh-trainer-rhel9@sha256:e3209b9069b11f1c1f172dc9a65dfaf8feab28d5b556a6cd598aa7260be61280
