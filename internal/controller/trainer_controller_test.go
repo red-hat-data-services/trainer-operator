@@ -61,8 +61,7 @@ func TestReconcileManaged(t *testing.T) {
 			Name: testTrainerName,
 		},
 		Spec: componentsv1alpha1.TrainerSpec{
-			ManagementState: common.Managed,
-			AppNamespace:    testTrainerNamespace,
+			AppNamespace: testTrainerNamespace,
 		},
 	}
 	g.Expect(k8sClient.Create(ctx, trainer)).To(Succeed())
@@ -104,42 +103,6 @@ func TestReconcileManaged(t *testing.T) {
 	g.Expect(cm.Labels).To(HaveKeyWithValue("platform.opendatahub.io/part-of", trainerPartOf))
 }
 
-func TestReconcileRemoved(t *testing.T) {
-	g := NewWithT(t)
-	ctx := context.Background()
-
-	trainer := &componentsv1alpha1.Trainer{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: testTrainerName,
-		},
-		Spec: componentsv1alpha1.TrainerSpec{
-			ManagementState: common.Removed,
-		},
-	}
-	g.Expect(k8sClient.Create(ctx, trainer)).To(Succeed())
-	t.Cleanup(func() { cleanupTrainer(ctx) })
-
-	reconciler := newTestReconciler()
-
-	_, err := reconciler.Reconcile(ctx, testRequest())
-	g.Expect(err).NotTo(HaveOccurred())
-
-	_, err = reconciler.Reconcile(ctx, testRequest())
-	g.Expect(err).NotTo(HaveOccurred())
-
-	updated := getTrainer(ctx, g)
-	g.Expect(updated.Status.Phase).To(Equal(common.PhaseNotReady))
-
-	readyCond := findCondition(updated, common.ConditionTypeReady)
-	g.Expect(readyCond).NotTo(BeNil())
-	g.Expect(readyCond.Status).To(Equal(metav1.ConditionFalse))
-
-	provCond := findCondition(updated, common.ConditionTypeProvisioningSucceeded)
-	g.Expect(provCond).NotTo(BeNil())
-	g.Expect(provCond.Status).To(Equal(metav1.ConditionFalse))
-	g.Expect(provCond.Reason).To(Equal("Removed"))
-}
-
 func TestReconcileDelete(t *testing.T) {
 	g := NewWithT(t)
 	ctx := context.Background()
@@ -147,9 +110,6 @@ func TestReconcileDelete(t *testing.T) {
 	trainer := &componentsv1alpha1.Trainer{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: testTrainerName,
-		},
-		Spec: componentsv1alpha1.TrainerSpec{
-			ManagementState: common.Managed,
 		},
 	}
 	g.Expect(k8sClient.Create(ctx, trainer)).To(Succeed())
@@ -272,6 +232,95 @@ func TestGetComponentReleases(t *testing.T) {
 	g.Expect(releases[0].RepoURL).NotTo(BeEmpty(), "RepoURL should not be empty")
 }
 
+func TestPlatformVersionHandshake(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+
+	createJobSetCRD(ctx, t, g)
+
+	handshakeNS := "handshake-test-ns"
+	platformVersion := "2.20.0"
+
+	trainer := &componentsv1alpha1.Trainer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: testTrainerName,
+		},
+		Spec: componentsv1alpha1.TrainerSpec{
+			AppNamespace: handshakeNS,
+		},
+	}
+	g.Expect(k8sClient.Create(ctx, trainer)).To(Succeed())
+	t.Cleanup(func() {
+		cleanupTrainer(ctx)
+		cleanupNamespace(ctx, handshakeNS)
+	})
+
+	reconciler := newTestReconciler()
+
+	// First reconcile: no platform ConfigMap exists — handshake skipped
+	_, err := reconciler.Reconcile(ctx, testRequest())
+	g.Expect(err).NotTo(HaveOccurred())
+	_, err = reconciler.Reconcile(ctx, testRequest())
+	g.Expect(err).NotTo(HaveOccurred())
+
+	updated := getTrainer(ctx, g)
+	for _, r := range updated.Status.Releases {
+		g.Expect(r.Name).NotTo(Equal(platformReleaseName), "platform release should not exist without ConfigMap")
+	}
+
+	// Create the platform config ConfigMap
+	platformCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      platformConfigMapName,
+			Namespace: handshakeNS,
+			Labels: map[string]string{
+				labels.PlatformPartOf: trainerPartOf,
+			},
+		},
+		Data: map[string]string{
+			platformVersionKey: platformVersion,
+		},
+	}
+	g.Expect(k8sClient.Create(ctx, platformCM)).To(Succeed())
+	t.Cleanup(func() {
+		_ = k8sClient.Delete(ctx, platformCM)
+	})
+
+	// Reconcile again — platform version should appear in releases
+	_, err = reconciler.Reconcile(ctx, testRequest())
+	g.Expect(err).NotTo(HaveOccurred())
+
+	updated = getTrainer(ctx, g)
+	var platformRelease *common.ComponentRelease
+	for i, r := range updated.Status.Releases {
+		if r.Name == platformReleaseName {
+			platformRelease = &updated.Status.Releases[i]
+			break
+		}
+	}
+	g.Expect(platformRelease).NotTo(BeNil(), "platform release entry should exist")
+	g.Expect(platformRelease.Version).To(Equal(platformVersion))
+
+	// Simulate platform upgrade: update ConfigMap to new version
+	upgradedVersion := "2.21.0"
+	platformCM.Data[platformVersionKey] = upgradedVersion
+	g.Expect(k8sClient.Update(ctx, platformCM)).To(Succeed())
+
+	_, err = reconciler.Reconcile(ctx, testRequest())
+	g.Expect(err).NotTo(HaveOccurred())
+
+	updated = getTrainer(ctx, g)
+	platformRelease = nil
+	for i, r := range updated.Status.Releases {
+		if r.Name == platformReleaseName {
+			platformRelease = &updated.Status.Releases[i]
+			break
+		}
+	}
+	g.Expect(platformRelease).NotTo(BeNil(), "platform release entry should exist after upgrade")
+	g.Expect(platformRelease.Version).To(Equal(upgradedVersion))
+}
+
 func TestReconcileManagedPopulatesReleases(t *testing.T) {
 	g := NewWithT(t)
 	ctx := context.Background()
@@ -283,8 +332,7 @@ func TestReconcileManagedPopulatesReleases(t *testing.T) {
 			Name: testTrainerName,
 		},
 		Spec: componentsv1alpha1.TrainerSpec{
-			ManagementState: common.Managed,
-			AppNamespace:    testTrainerNamespace,
+			AppNamespace: testTrainerNamespace,
 		},
 	}
 	g.Expect(k8sClient.Create(ctx, trainer)).To(Succeed())
@@ -308,7 +356,7 @@ func TestReconcileManagedPopulatesReleases(t *testing.T) {
 	g.Expect(updated.Status.Releases[0].RepoURL).To(Equal("https://github.com/kubeflow/trainer"))
 }
 
-func TestReconcileManagedToRemovedToManaged(t *testing.T) {
+func TestReconcileDeleteAndRecreate(t *testing.T) {
 	g := NewWithT(t)
 	ctx := context.Background()
 
@@ -320,8 +368,7 @@ func TestReconcileManagedToRemovedToManaged(t *testing.T) {
 			Name: testTrainerName,
 		},
 		Spec: componentsv1alpha1.TrainerSpec{
-			ManagementState: common.Managed,
-			AppNamespace:    lifecycleNS,
+			AppNamespace: lifecycleNS,
 		},
 	}
 	g.Expect(k8sClient.Create(ctx, trainer)).To(Succeed())
@@ -332,27 +379,36 @@ func TestReconcileManagedToRemovedToManaged(t *testing.T) {
 
 	reconciler := newTestReconciler()
 
-	// Reach Ready state (tested in detail by TestReconcileManaged)
+	// Reach Ready state
 	_, err := reconciler.Reconcile(ctx, testRequest())
 	g.Expect(err).NotTo(HaveOccurred())
 	_, err = reconciler.Reconcile(ctx, testRequest())
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(getTrainer(ctx, g).Status.Phase).To(Equal(common.PhaseReady))
 
-	// Transition to Removed
+	// Delete the CR (platform removes it when module is disabled)
 	updated := getTrainer(ctx, g)
-	updated.Spec.ManagementState = common.Removed
-	g.Expect(k8sClient.Update(ctx, updated)).To(Succeed())
+	g.Expect(k8sClient.Delete(ctx, updated)).To(Succeed())
 
 	_, err = reconciler.Reconcile(ctx, testRequest())
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(getTrainer(ctx, g).Status.Phase).To(Equal(common.PhaseNotReady))
 
-	// Transition back to Managed — resources must be re-provisioned
-	updated = getTrainer(ctx, g)
-	updated.Spec.ManagementState = common.Managed
-	g.Expect(k8sClient.Update(ctx, updated)).To(Succeed())
+	err = k8sClient.Get(ctx, types.NamespacedName{Name: testTrainerName}, &componentsv1alpha1.Trainer{})
+	g.Expect(errors.IsNotFound(err)).To(BeTrue(), "Trainer should be deleted")
 
+	// Recreate the CR (platform re-enables the module)
+	trainer = &componentsv1alpha1.Trainer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: testTrainerName,
+		},
+		Spec: componentsv1alpha1.TrainerSpec{
+			AppNamespace: lifecycleNS,
+		},
+	}
+	g.Expect(k8sClient.Create(ctx, trainer)).To(Succeed())
+
+	_, err = reconciler.Reconcile(ctx, testRequest())
+	g.Expect(err).NotTo(HaveOccurred())
 	_, err = reconciler.Reconcile(ctx, testRequest())
 	g.Expect(err).NotTo(HaveOccurred())
 
@@ -507,6 +563,7 @@ func newUnstructured(gvk schema.GroupVersionKind, name, namespace string, objLab
 func newTestReconciler() *TrainerReconciler {
 	return &TrainerReconciler{
 		Client:           k8sClient,
+		APIReader:        k8sClient,
 		Scheme:           k8sClient.Scheme(),
 		ManifestsPath:    testManifestsPath,
 		RuntimesPath:     testRuntimesPath,
