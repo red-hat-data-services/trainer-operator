@@ -95,12 +95,11 @@ func main() {
 			SecureServing: false,
 		},
 		HealthProbeBindAddress: probeAddr,
-		// Cache hardening: without label selectors, informer caches store
-		// every object of each watched type — even those unrelated to this
-		// operator. A user with edit permissions can create enough large
-		// objects to OOMKill the operator. Label selectors ensure only
-		// trainer-managed resources are cached.
-		// See: https://developers.redhat.com/articles/2026/06/01/protect-your-kubernetes-operator-oomkill
+		// Cache hardening: label selectors ensure only trainer-managed
+		// resources are cached. ConfigMaps are excluded from the label
+		// filter because the platform config ConfigMap (odh-trainer-config)
+		// is created by the platform operator without the trainer label;
+		// namespace scoping via DefaultNamespaces bounds the cached set.
 		Cache: cache.Options{
 			DefaultTransform:  platformcache.StripUnusedFields(),
 			DefaultNamespaces: cacheNamespaces,
@@ -109,9 +108,6 @@ func main() {
 					Label: labels.SelectorFromSet(labels.Set{platformlabels.PlatformPartOf: trainerPartOf}),
 				},
 				&corev1.Service{}: {
-					Label: labels.SelectorFromSet(labels.Set{platformlabels.PlatformPartOf: trainerPartOf}),
-				},
-				&corev1.ConfigMap{}: {
 					Label: labels.SelectorFromSet(labels.Set{platformlabels.PlatformPartOf: trainerPartOf}),
 				},
 				&admissionv1.ValidatingWebhookConfiguration{}: {
