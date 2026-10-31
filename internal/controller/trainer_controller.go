@@ -40,6 +40,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
+	configv1 "github.com/openshift/api/config/v1"
+
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/controller/gc"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/metadata/labels"
@@ -116,6 +118,9 @@ type ReconcilerConfig struct {
 	RuntimesPath     string
 	ImageStreamsPath string
 	WorkDir          string
+	// TLSProfile is the effective cluster TLS profile rendered into the
+	// operand's controller configuration.
+	TLSProfile configv1.TLSProfileSpec
 }
 
 type trainerActions struct {
@@ -124,6 +129,7 @@ type trainerActions struct {
 	runtimesPath     string
 	imageStreamsPath string
 	workDir          string
+	tlsProfile       configv1.TLSProfileSpec
 	reconciler       *reconciler.Reconciler
 }
 
@@ -156,12 +162,13 @@ type trainerActions struct {
 // +kubebuilder:rbac:groups=authorization.k8s.io,resources=subjectaccessreviews,verbs=create
 // +kubebuilder:rbac:urls=/metrics,verbs=get
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=podmonitors;servicemonitors,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=monitoring.coreos.com,resources=prometheusrules,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=mutatingwebhookconfigurations;validatingwebhookconfigurations,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=jobset.x-k8s.io,resources=jobsets,verbs=create;delete;get;list;patch;update;watch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get;list;watch
-// +kubebuilder:rbac:groups=scheduling.volcano.sh,resources=podgroups,verbs=create;get;list;patch;update;watch
+// +kubebuilder:rbac:groups=scheduling.volcano.sh,resources=podgroups,verbs=create;delete;get;list;patch;update;watch
 // +kubebuilder:rbac:groups=scheduling.x-k8s.io,resources=podgroups,verbs=create;get;list;patch;update;watch
 // +kubebuilder:rbac:groups=scheduling.k8s.io,resources=priorityclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=trainer.kubeflow.org,resources=clustertrainingruntimes;trainingruntimes,verbs=get;list;watch;create;update;patch;delete
@@ -186,6 +193,7 @@ func NewReconciler(ctx context.Context, mgr ctrl.Manager, cfg *ReconcilerConfig)
 		runtimesPath:     cfg.RuntimesPath,
 		imageStreamsPath: cfg.ImageStreamsPath,
 		workDir:          cfg.WorkDir,
+		tlsProfile:       cfg.TLSProfile,
 	}
 
 	nsFn := func(_ context.Context, rr *types.ReconciliationRequest) (string, error) {
@@ -356,6 +364,7 @@ func (m *trainerActions) renderManifests(ctx context.Context, rr *types.Reconcil
 			staticParams: map[string]string{paramOperatorNamespace: namespace},
 			namespace:    namespace,
 			overlay:      defaultOverlay,
+			operandTLS:   true,
 		},
 		{
 			name:             "runtimes",
@@ -378,7 +387,7 @@ func (m *trainerActions) renderManifests(ctx context.Context, rr *types.Reconcil
 	}
 
 	for _, rs := range resourceSets {
-		rendered, err := m.renderResourceSet(rs)
+		rendered, err := m.renderResourceSet(ctx, rs)
 		if err != nil {
 			return err
 		}
@@ -390,7 +399,7 @@ func (m *trainerActions) renderManifests(ctx context.Context, rr *types.Reconcil
 	return nil
 }
 
-func (m *trainerActions) renderResourceSet(rs resourceSet) ([]unstructured.Unstructured, error) {
+func (m *trainerActions) renderResourceSet(ctx context.Context, rs resourceSet) ([]unstructured.Unstructured, error) {
 	workDir := filepath.Join(m.workDir, rs.subDir)
 
 	if err := ensureWorkDir(rs.templatePath, workDir); err != nil {
@@ -418,6 +427,12 @@ func (m *trainerActions) renderResourceSet(rs resourceSet) ([]unstructured.Unstr
 
 	if rs.filterConfigMaps {
 		rendered = filterConfigMaps(rendered)
+	}
+
+	if rs.operandTLS {
+		if err := applyOperandTLSOptions(ctx, rendered, m.tlsProfile); err != nil {
+			return nil, fmt.Errorf("applying operand TLS options to %s: %w", rs.name, err)
+		}
 	}
 
 	return rendered, nil
@@ -561,6 +576,10 @@ type resourceSet struct {
 	namespace        string
 	overlay          string
 	filterConfigMaps bool
+	// operandTLS injects the effective cluster TLS profile into the
+	// operand's controller_manager_config.yaml and rolls the operand
+	// deployment when the rendered configuration changes.
+	operandTLS bool
 }
 
 func cleanupTrainerResources(ctx context.Context, dynClient dynamic.Interface) {
@@ -620,6 +639,14 @@ func removeRuntimeFinalizers(ctx context.Context, dynClient dynamic.Interface) e
 			LabelSelector: selector,
 		})
 		if err != nil {
+			// The upstream trainer CRDs are only installed when the Trainer
+			// control plane is deployed. If dependencies were missing, the
+			// API does not exist and there is nothing to clean up; failing
+			// here would leave the Trainer CR stuck on its finalizer.
+			if errors.IsNotFound(err) {
+				log.V(1).Info("Runtime API not available, nothing to remove", "gvr", gvr)
+				continue
+			}
 			return fmt.Errorf("listing %s for finalizer removal: %w", gvr.Resource, err)
 		}
 
