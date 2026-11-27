@@ -9,9 +9,10 @@ metadata:
     pipelinesascode.tekton.dev/max-keep-runs: "3"
     pipelinesascode.tekton.dev/on-comment: '^/build-konflux'
     build.appstudio.redhat.com/pull_request_number: "{{pull_request_number}}"
+    # UBI10 migration test: tag :ubi10 until -rhel10 quay is ready.
     pipelinesascode.tekton.dev/on-cel-expression: |-
       event == "pull_request"
-      && (files.all.exists(p, ! p.matches('^\\.tekton/')) || ".tekton/odh-trainer-operator-pull-request.yaml".pathChanged())
+      && (files.all.exists(p, ! p.matches('^\\.tekton/')) || ".tekton/odh-trainer-operator-pull-request.yaml".pathChanged() || "Dockerfile.konflux".pathChanged())
   labels:
     appstudio.openshift.io/application: rhoai-v3-7-ea-1
     appstudio.openshift.io/component: odh-trainer-operator-v3-7-ea-1
@@ -25,13 +26,13 @@ spec:
   - name: revision
     value: '{{revision}}'
   - name: output-image
-    value: quay.io/rhoai/odh-trainer-operator-rhel9:on-pr-{{pull_request_number}}
+    value: quay.io/rhoai/odh-trainer-operator-rhel9:ubi10
   - name: dockerfile
     value: Dockerfile.konflux
   - name: path-context
     value: .
   - name: image-expires-after
-    value: 30d
+    value: 5d
   - name: enable-slack-failure-notification
     value: "false"
   - name: prefetch-input
